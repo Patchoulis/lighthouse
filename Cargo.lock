@@ -2808,6 +2808,7 @@ dependencies = [
  "tracing",
  "types",
  "url",
+ "walkdir",
  "zip",
 ]
 

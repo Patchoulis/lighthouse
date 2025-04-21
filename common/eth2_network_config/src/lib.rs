@@ -21,12 +21,15 @@ use sensitive_url::SensitiveUrl;
 use sha2::{Digest, Sha256};
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
 use types::{BeaconState, ChainSpec, Config, EthSpec, EthSpecId, Hash256};
 use url::Url;
+use walkdir::WalkDir;
+use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use serde_yaml::Value;
 
 pub use eth2_config::GenesisStateSource;
 
@@ -34,6 +37,7 @@ pub const DEPLOY_BLOCK_FILE: &str = "deposit_contract_block.txt";
 pub const BOOT_ENR_FILE: &str = "boot_enr.yaml";
 pub const GENESIS_STATE_FILE: &str = "genesis.ssz";
 pub const BASE_CONFIG_FILE: &str = "config.yaml";
+pub const PRESET_DIRECTORY: &str = "../../consensus/types/presets/";
 
 // Creates definitions for:
 //
@@ -71,6 +75,39 @@ impl From<Vec<u8>> for GenesisStateBytes {
     fn from(vec: Vec<u8>) -> Self {
         GenesisStateBytes::Vec(vec)
     }
+}
+
+/// Recursively finds all .yaml files under a directory
+fn get_yaml_files<P: AsRef<Path>>(root: P) -> Vec<PathBuf> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "yaml")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+/// Recursively finds all .yaml files under a directory, and returns every named field in those .yaml files
+fn get_preset_keys<P: AsRef<Path>>(root: P) -> HashSet<Value> {
+    let mut preset_keys: HashSet<Value> = HashSet::new();
+    let files = get_yaml_files(root);
+    for file in files {
+        if let Ok(reader) = File::open(&file) {
+            if let Ok(yaml) = serde_yaml::from_reader::<_, Value>(reader) {
+                if let Some(map) = yaml.as_mapping() {
+                    preset_keys.extend(map.keys().cloned());
+                }
+            }
+        }
+    }
+    preset_keys
 }
 
 /// Specifies an Eth2 network.
@@ -342,6 +379,20 @@ impl Eth2NetworkConfig {
 
         let deposit_contract_deploy_block = load_from_file!(DEPLOY_BLOCK_FILE);
         let boot_enr = optional_load_from_file!(BOOT_ENR_FILE);
+
+        // Checks to see if the user set configs contain any of the already defined preset values
+        let presets = get_preset_keys(PRESET_DIRECTORY);
+        let yaml_mapping: Value = load_from_file!(BASE_CONFIG_FILE);
+        let config_keys = yaml_mapping.as_mapping()
+            .ok_or_else(|| format!("{} must consist of only key value pairs", BASE_CONFIG_FILE))?;
+
+        for key in config_keys.keys() {
+            if presets.contains(key) { 
+                return Err(format!("{} contains the a preset key: {:?}", BASE_CONFIG_FILE, key));
+            }
+        }
+        
+        
         let config = load_from_file!(BASE_CONFIG_FILE);
 
         // The genesis state is a special case because it uses SSZ, not YAML.
@@ -473,6 +524,28 @@ mod tests {
     #[test]
     fn default_network_exists() {
         assert!(HARDCODED_NET_NAMES.contains(&DEFAULT_HARDCODED_NETWORK));
+    }
+
+    #[test]
+    fn get_preset_files() {
+        let preset_files = get_yaml_files(PRESET_DIRECTORY);
+        let check_files = ["altair.yaml", "fulu.yaml", "phase0.yaml","bellatrix.yaml","deneb.yaml","capella.yaml"];
+        for check in check_files.into_iter() {
+            let contains_check = preset_files.iter().any(|path| {
+                path.file_name().map_or(false, |name| name.to_str() == Some(check))
+            });
+            assert!(contains_check,"{:?} was not found",check);
+        }
+    }
+
+    #[test]
+    fn test_preset_keys() {
+        let preset_keys = get_preset_keys(PRESET_DIRECTORY);
+        let check_keys = ["BYTES_PER_LOGS_BLOOM\n","MAX_EXTRA_DATA_BYTES\n","SYNC_COMMITTEE_SIZE\n"];
+        for check in check_keys.into_iter() {
+            let presets: Vec<String> = preset_keys.iter().filter_map(|key|serde_yaml::to_string(&key).ok()).collect();
+            assert!(presets.contains(&check.to_string()));
+        }
     }
 
     #[test]
