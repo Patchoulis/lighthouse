@@ -28,7 +28,7 @@ use types::{BeaconState, ChainSpec, Config, EthSpec, EthSpecId, Hash256};
 use url::Url;
 use walkdir::WalkDir;
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use serde_yaml::Value;
 
 pub use eth2_config::GenesisStateSource;
@@ -37,7 +37,7 @@ pub const DEPLOY_BLOCK_FILE: &str = "deposit_contract_block.txt";
 pub const BOOT_ENR_FILE: &str = "boot_enr.yaml";
 pub const GENESIS_STATE_FILE: &str = "genesis.ssz";
 pub const BASE_CONFIG_FILE: &str = "config.yaml";
-pub const PRESET_DIRECTORY: &str = "../../consensus/types/presets/";
+pub const PRESET_DIRECTORY: &str = "built_in_network_configs";
 
 // Creates definitions for:
 //
@@ -77,32 +77,34 @@ impl From<Vec<u8>> for GenesisStateBytes {
     }
 }
 
-/// Recursively finds all .yaml files under a directory
-fn get_yaml_files<P: AsRef<Path>>(root: P) -> Vec<PathBuf> {
+/// Recursively finds all config.yaml files under a directory
+fn get_config_files<P: AsRef<Path>>(root: P) -> Vec<PathBuf> {
     WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .filter(|entry| {
             let path = entry.path();
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext == "yaml")
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "config.yaml")
                 .unwrap_or(false)
         })
         .map(|entry| entry.into_path())
         .collect()
 }
 
-/// Recursively finds all .yaml files under a directory, and returns every named field in those .yaml files
-fn get_preset_keys<P: AsRef<Path>>(root: P) -> HashSet<Value> {
-    let mut preset_keys: HashSet<Value> = HashSet::new();
-    let files = get_yaml_files(root);
+/// Recursively finds all config.yaml files under a directory, and returns every named field in those .yaml files
+fn get_preset_keys<P: AsRef<Path>>(root: P) -> HashMap<Value, Value> {
+    let mut preset_keys: HashMap<Value, Value> = HashMap::new();
+    let files = get_config_files(root);
     for file in files {
         if let Ok(reader) = File::open(&file) {
             if let Ok(yaml) = serde_yaml::from_reader::<_, Value>(reader) {
                 if let Some(map) = yaml.as_mapping() {
-                    preset_keys.extend(map.keys().cloned());
+                    for (k, v) in map {
+                        preset_keys.insert(k.clone(), v.clone());
+                    }
                 }
             }
         }
@@ -379,21 +381,22 @@ impl Eth2NetworkConfig {
 
         let deposit_contract_deploy_block = load_from_file!(DEPLOY_BLOCK_FILE);
         let boot_enr = optional_load_from_file!(BOOT_ENR_FILE);
+        let config: Config = load_from_file!(BASE_CONFIG_FILE);
 
         // Checks to see if the user set configs contain any of the already defined preset values
-        let presets = get_preset_keys(PRESET_DIRECTORY);
-        let yaml_mapping: Value = load_from_file!(BASE_CONFIG_FILE);
-        let config_keys = yaml_mapping.as_mapping()
-            .ok_or_else(|| format!("{} must consist of only key value pairs", BASE_CONFIG_FILE))?;
-
-        for key in config_keys.keys() {
-            if presets.contains(key) { 
-                return Err(format!("{} contains the a preset key: {:?}", BASE_CONFIG_FILE, key));
+        if config.eth_spec_id().is_some() {
+            let presets = get_preset_keys(PRESET_DIRECTORY);
+            let yaml_mapping: Value = load_from_file!(BASE_CONFIG_FILE);
+            let config_keys = yaml_mapping.as_mapping()
+                .ok_or_else(|| format!("{} must consist of only key value pairs", BASE_CONFIG_FILE))?;
+            
+            for (key, value) in config_keys.into_iter() {
+                let expected_val = presets.get(key);
+                if expected_val.is_some() && (Some(value) != expected_val) {
+                    return Err(format!("{:?} in {} has {:?}, expected {:?}", key, BASE_CONFIG_FILE,value,expected_val));
+                }
             }
         }
-        
-        
-        let config = load_from_file!(BASE_CONFIG_FILE);
 
         // The genesis state is a special case because it uses SSZ, not YAML.
         let genesis_file_path = base_dir.join(GENESIS_STATE_FILE);
@@ -527,19 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn get_preset_files() {
-        let preset_files = get_yaml_files(PRESET_DIRECTORY);
-        let check_files = ["altair.yaml", "fulu.yaml", "phase0.yaml","bellatrix.yaml","deneb.yaml","capella.yaml"];
-        for check in check_files.into_iter() {
-            let contains_check = preset_files.iter().any(|path| {
-                path.file_name().map_or(false, |name| name.to_str() == Some(check))
-            });
-            assert!(contains_check,"{:?} was not found",check);
-        }
+    fn get_hardcoded_files() {
+        let hardcoded_files = get_config_files(PRESET_DIRECTORY);
+        assert_eq!(hardcoded_files.into_iter().count(),6);
     }
 
     #[test]
-    fn test_preset_keys() {
+    fn test_hardcoded_keys() {
         let preset_keys = get_preset_keys(PRESET_DIRECTORY);
         let check_keys = ["BYTES_PER_LOGS_BLOOM\n","MAX_EXTRA_DATA_BYTES\n","SYNC_COMMITTEE_SIZE\n"];
         for check in check_keys.into_iter() {
